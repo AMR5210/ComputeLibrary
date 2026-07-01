@@ -306,11 +306,178 @@ FIXTURE_DATA_TEST_CASE(
 {
     validate(Accessor(_target), _reference, rel_tolerance_f32, tolerance_num_dequantize_f32, float(abs_tolerance_f32));
 }
-TEST_SUITE_END() // QASYMM8_SIGNED
-#endif // #ifdef __aarch64__
 
 // clang-format on
 // *INDENT-ON*
+
+TEST_SUITE(DequantizeFloat)
+
+const auto DequantizeFloatOffsetsDataset =
+    zip(make("InputQI",
+             {QuantizationInfo(0.25f, 0), QuantizationInfo(0.25f, -10), QuantizationInfo(0.25f, 12),
+              QuantizationInfo(0.25f, 0), QuantizationInfo(0.25f, 0), QuantizationInfo(0.25f, -20),
+              QuantizationInfo(0.01f, 100)}),
+        make("WeightsQI",
+             {QuantizationInfo(0.125f, 0), QuantizationInfo(0.125f, 0), QuantizationInfo(0.125f, 0),
+              QuantizationInfo(0.125f, 5), QuantizationInfo(0.125f, -8), QuantizationInfo(0.125f, 10),
+              QuantizationInfo(0.01f, -100)}));
+
+const auto DequantizeFloatActivationDataset =
+    make("ActivationInfo",
+         {ActivationLayerInfo(), ActivationLayerInfo(ActivationLayerInfo::ActivationFunction::RELU),
+          ActivationLayerInfo(ActivationLayerInfo::ActivationFunction::BOUNDED_RELU, 6.0f),
+          ActivationLayerInfo(ActivationLayerInfo::ActivationFunction::LU_BOUNDED_RELU, 6.0f, -6.0f)});
+
+const auto DequantizeFloatBasicActivationDataset =
+    make("ActivationInfo", {ActivationLayerInfo(), ActivationLayerInfo(ActivationLayerInfo::ActivationFunction::RELU)});
+
+const auto DequantizeFloatPaddedActivationDataset =
+    make("ActivationInfo",
+         {ActivationLayerInfo(), ActivationLayerInfo(ActivationLayerInfo::ActivationFunction::BOUNDED_RELU, 6.0f)});
+
+/** Validate accepts QASYMM8_SIGNED to F32 dequantized convolutions with zero and non-zero offsets.
+ *  Shapes use NHWC: [C, W, H] for input/output, [Cin, Kw, Kh, Cout] for weights. */
+DATA_TEST_CASE(Validate,
+               framework::DatasetMode::ALL,
+               zip(make("SrcInfo",
+                        {TensorInfo(TensorShape(16U, 8U, 8U), 1, DataType::QASYMM8_SIGNED, DataLayout::NHWC),
+                         TensorInfo(TensorShape(32U, 4U, 4U), 1, DataType::QASYMM8_SIGNED, DataLayout::NHWC),
+                         TensorInfo(TensorShape(16U, 8U, 8U), 1, DataType::QASYMM8_SIGNED, DataLayout::NHWC),
+                         TensorInfo(TensorShape(16U, 8U, 8U), 1, DataType::QASYMM8_SIGNED, DataLayout::NHWC)}),
+                   make("WgtInfo",
+                        {TensorInfo(TensorShape(16U, 3U, 3U, 8U), 1, DataType::QASYMM8_SIGNED, DataLayout::NHWC),
+                         TensorInfo(TensorShape(32U, 1U, 1U, 16U), 1, DataType::QASYMM8_SIGNED, DataLayout::NHWC),
+                         TensorInfo(TensorShape(16U, 3U, 3U, 8U), 1, DataType::QASYMM8_SIGNED, DataLayout::NHWC),
+                         TensorInfo(TensorShape(16U, 3U, 3U, 8U), 1, DataType::QASYMM8_SIGNED, DataLayout::NHWC)}),
+                   make("BiasInfo",
+                        {TensorInfo(TensorShape(8U), 1, DataType::F32), TensorInfo(TensorShape(16U), 1, DataType::F32),
+                         TensorInfo(TensorShape(8U), 1, DataType::F32), TensorInfo(TensorShape(8U), 1, DataType::F32)}),
+                   make("DstInfo",
+                        {TensorInfo(TensorShape(8U, 6U, 6U), 1, DataType::F32, DataLayout::NHWC),
+                         TensorInfo(TensorShape(16U, 4U, 4U), 1, DataType::F32, DataLayout::NHWC),
+                         TensorInfo(TensorShape(8U, 6U, 6U), 1, DataType::F32, DataLayout::NHWC),
+                         TensorInfo(TensorShape(8U, 6U, 6U), 1, DataType::F32, DataLayout::NHWC)}),
+                   make("SrcOffset", {0, 0, 5, -10}),
+                   make("WgtOffset", {0, 0, 0, 3}),
+                   make("Expected", {true, true, true, true})),
+               src_info_const,
+               wgt_info_const,
+               bias_info_const,
+               dst_info_const,
+               src_offset,
+               wgt_offset,
+               expected)
+{
+    TensorInfo src_info  = src_info_const;
+    TensorInfo wgt_info  = wgt_info_const;
+    TensorInfo bias_info = bias_info_const;
+    TensorInfo dst_info  = dst_info_const;
+    src_info.set_quantization_info(QuantizationInfo(0.25f, src_offset));
+    wgt_info.set_quantization_info(QuantizationInfo(0.125f, wgt_offset));
+
+    const Status s = NEConvolutionLayer::validate(&src_info, &wgt_info, &bias_info, &dst_info,
+                                                  PadStrideInfo(1, 1, 0, 0), WeightsInfo(), Size2D(1U, 1U),
+                                                  ActivationLayerInfo(), false /*fast_math*/, 1 /*num_groups*/);
+    ARM_COMPUTE_EXPECT(bool(s) == expected, framework::LogLevel::ERRORS);
+}
+
+/** Verify GEMM_CONV2D is returned automatically for NHWC QASYMM8_SIGNED to F32 dequantized convolution. */
+TEST_CASE(GetConvMethod, framework::DatasetMode::ALL)
+{
+    const QuantizationInfo qi(0.25f, 0);
+    TensorInfo             src_info(TensorShape(16U, 8U, 8U), 1, DataType::QASYMM8_SIGNED, DataLayout::NHWC);
+    TensorInfo             wgt_info(TensorShape(16U, 3U, 3U, 8U), 1, DataType::QASYMM8_SIGNED, DataLayout::NHWC);
+    TensorInfo             dst_info(TensorShape(8U, 6U, 6U), 1, DataType::F32, DataLayout::NHWC);
+    src_info.set_quantization_info(qi);
+    wgt_info.set_quantization_info(qi);
+
+    const ConvolutionMethod m = NEConvolutionLayer::get_convolution_method(
+        &src_info.clone()->set_is_resizable(true), &wgt_info.clone()->set_is_resizable(true),
+        &dst_info.clone()->set_is_resizable(true), PadStrideInfo(1, 1, 0, 0), WeightsInfo(), Size2D(1U, 1U),
+        ActivationLayerInfo(), false /*fast_math*/);
+    ARM_COMPUTE_EXPECT(m == ConvolutionMethod::GEMM_CONV2D, framework::LogLevel::ERRORS);
+}
+
+using NEDequantizeFloatConvolutionFixture = DequantizeFloatConvolutionFixture<Tensor, Accessor, NEConvolutionLayer>;
+
+/** Small 3x3 convolutions with dequantized F32 output.
+ *  Shapes are in NCHW format [W, H, C] for input/output, [Kw, Kh, Cin, Cout] for weights.
+ *  InputShape/WeightsShape/BiasShape/OutputShape are zipped; each row is one consistent config. */
+FIXTURE_DATA_TEST_CASE(RunSmall,
+                       NEDequantizeFloatConvolutionFixture,
+                       framework::DatasetMode::ALL,
+                       combine(zip(make("InputShape", {TensorShape(8U, 8U, 16U), TensorShape(16U, 16U, 32U)}),
+                                   make("WeightsShape", {TensorShape(3U, 3U, 16U, 8U), TensorShape(3U, 3U, 32U, 16U)}),
+                                   make("BiasShape", {TensorShape(8U), TensorShape(16U)}),
+                                   make("OutputShape", {TensorShape(6U, 6U, 8U), TensorShape(14U, 14U, 16U)})),
+                               make("ConvInfo", {PadStrideInfo(1, 1, 0, 0)}),
+                               make("Dilation", {Size2D(1U, 1U)}),
+                               make("ReshapeWeights", {true}),
+                               make("DataLayout", {DataLayout::NHWC}),
+                               DequantizeFloatActivationDataset,
+                               DequantizeFloatOffsetsDataset))
+{
+    validate(Accessor(_target), _reference, rel_tolerance_f32, tolerance_num_dequantize_f32, float(abs_tolerance_f32));
+}
+
+/** Stride-2 3x3 convolution. */
+FIXTURE_DATA_TEST_CASE(RunStride2,
+                       NEDequantizeFloatConvolutionFixture,
+                       framework::DatasetMode::ALL,
+                       combine(zip(make("InputShape", {TensorShape(14U, 14U, 16U), TensorShape(14U, 14U, 32U)}),
+                                   make("WeightsShape", {TensorShape(3U, 3U, 16U, 8U), TensorShape(3U, 3U, 32U, 16U)}),
+                                   make("BiasShape", {TensorShape(8U), TensorShape(16U)}),
+                                   make("OutputShape", {TensorShape(6U, 6U, 8U), TensorShape(6U, 6U, 16U)})),
+                               make("ConvInfo", {PadStrideInfo(2, 2, 0, 0)}),
+                               make("Dilation", {Size2D(1U, 1U)}),
+                               make("ReshapeWeights", {true}),
+                               make("DataLayout", {DataLayout::NHWC}),
+                               DequantizeFloatBasicActivationDataset,
+                               DequantizeFloatOffsetsDataset))
+{
+    validate(Accessor(_target), _reference, rel_tolerance_f32, tolerance_num_dequantize_f32, float(abs_tolerance_f32));
+}
+
+/** 1x1 convolution. */
+FIXTURE_DATA_TEST_CASE(Run1x1,
+                       NEDequantizeFloatConvolutionFixture,
+                       framework::DatasetMode::ALL,
+                       combine(zip(make("InputShape", {TensorShape(8U, 8U, 16U), TensorShape(8U, 8U, 32U)}),
+                                   make("WeightsShape", {TensorShape(1U, 1U, 16U, 8U), TensorShape(1U, 1U, 32U, 16U)}),
+                                   make("BiasShape", {TensorShape(8U), TensorShape(16U)}),
+                                   make("OutputShape", {TensorShape(8U, 8U, 8U), TensorShape(8U, 8U, 16U)})),
+                               make("ConvInfo", {PadStrideInfo(1, 1, 0, 0)}),
+                               make("Dilation", {Size2D(1U, 1U)}),
+                               make("ReshapeWeights", {true}),
+                               make("DataLayout", {DataLayout::NHWC}),
+                               DequantizeFloatBasicActivationDataset,
+                               DequantizeFloatOffsetsDataset))
+{
+    validate(Accessor(_target), _reference, rel_tolerance_f32, tolerance_num_dequantize_f32, float(abs_tolerance_f32));
+}
+
+/** Padded convolution. */
+FIXTURE_DATA_TEST_CASE(RunPadded,
+                       NEDequantizeFloatConvolutionFixture,
+                       framework::DatasetMode::ALL,
+                       combine(zip(make("InputShape", {TensorShape(8U, 8U, 16U), TensorShape(8U, 8U, 32U)}),
+                                   make("WeightsShape", {TensorShape(3U, 3U, 16U, 8U), TensorShape(3U, 3U, 32U, 16U)}),
+                                   make("BiasShape", {TensorShape(8U), TensorShape(16U)}),
+                                   make("OutputShape", {TensorShape(8U, 8U, 8U), TensorShape(8U, 8U, 16U)})),
+                               make("ConvInfo", {PadStrideInfo(1, 1, 1, 1)}),
+                               make("Dilation", {Size2D(1U, 1U)}),
+                               make("ReshapeWeights", {true}),
+                               make("DataLayout", {DataLayout::NHWC}),
+                               DequantizeFloatPaddedActivationDataset,
+                               DequantizeFloatOffsetsDataset))
+{
+    validate(Accessor(_target), _reference, rel_tolerance_f32, tolerance_num_dequantize_f32, float(abs_tolerance_f32));
+}
+
+TEST_SUITE_END() // DequantizeFloat
+TEST_SUITE_END() // QASYMM8_SIGNED
+#endif           // #ifdef __aarch64__
+
 TEST_SUITE_END() // ConvolutionLayer
 
 /*
